@@ -1,0 +1,332 @@
+---
+- name: Update host firmware
+# Requires update_firmware_using_catalog.py from https://github.com/dell/OpenManage-Enterprise/blob/main/Python/update_firmware_using_catalog.py
+# SETUP: export OMEUSERNAME=monash\yourOMEusername; export OMEPASSWORD=yourOMEpassword
+# SETUP2: export CURRENT_WORK_HOSTS=<hostnamegoeshere>
+# EXAMPLE: export CURRENT_WORK_HOSTS=rccomdc1rh38-24,rccomdc1rh39-17,rccomdc1rh39-18,rccomdc1rh39-19
+# Usage: ansible-playbook monash_ome_upgrade_firmware-multiplehosts.yml
+  hosts: localhost
+  gather_facts: no
+  
+  vars:
+    base_url: "{{ lookup('env', 'OMEURL') }}"
+    omeusername: "{{ lookup('env', 'OMEUSERNAME') }}"
+    omepassword: "{{ lookup('env', 'OMEPASSWORD') }}"
+    hostname: "{{ lookup('env', 'CURRENT_WORK_HOSTS') }}"
+    hostname_list: "{{ hostname.split(',') }}"
+
+  tasks:
+
+
+    - name: Test to make sure SSH is working on the hosts
+      become: yes
+      shell: "lsb_release -a"
+      async: 45
+      poll: 0
+      delegate_to: "{{ item }}"
+      loop: "{{ hostname.split(',') }}"
+
+
+    - name: Create user session in OME
+      ansible.builtin.uri:
+        url: "{{  base_url }}/api/SessionService/Sessions"
+        user: "{{ omeusername }}"
+        password: "{{ omepassword }}"
+        method: "POST"
+        force_basic_auth: yes
+        validate_certs: no  #This should be enabled in production
+        headers:
+          Accept: "application/json"
+          Content-Type: "application/json"
+        body:
+          UserName: "{{ omeusername }}"
+          Password: "{{ omepassword }}"
+          SessionType: "API"
+        body_format: json
+        status_code: [200, 201]
+      delegate_to: localhost
+      register: auth_response
+
+
+    - name: Print the response from OME
+      debug:
+        msg: "{{auth_response}}"
+
+    - name: Extract authentication token from response
+      set_fact:
+        auth_token: "{{ auth_response.x_auth_token }}"
+
+    - name: Print the X-Auth-Token #Should this be hidden in logs?
+      debug:
+        msg: "{{auth_token}}"
+
+    - name: Block of tasks to get host info and disable alerts while we do upgrades
+      block:
+        - name: Get host information
+          uri:
+            url: "{{ base_url }}/api/DeviceService/Devices?$filter=DeviceName%20eq%20'{{ item }}'"
+            validate_certs: no  #This should be enabled in production
+            headers:
+              X-Auth-Token: "{{ auth_token }}"
+          register: host_response
+          with_items: "{{ hostname_list }}"
+
+        - name: "Debug"
+          debug:
+            var: host_response
+          
+                   
+        - name: Print the device ID
+          debug:
+            msg: "{{ item.json.value[0].Id }}"
+          with_items: "{{ host_response.results }}"
+
+        - name: Register DeviceID
+          set_fact:
+            device_id: "{{ item.json.value[0].Id }}"
+          with_items: "{{ host_response.results }}"
+
+
+        - name: "Debug2"
+          debug:
+            var: device_id
+          with_items: "{{ host_response.results }}"
+
+        - name: Create alert policy
+          uri:
+            url: "{{ base_url }}/api/AlertService/AlertPolicies"
+            method: POST
+            headers:
+              Content-Type: application/json
+              X-Auth-Token: "{{ auth_token }}"
+            body_format: json
+            body: '{"DefaultPolicy":false,"Description":"Ignores all alerts generated from {{ item }}-d1.erc.monash.edu.au","Enabled":true,"Name":"{{ item }} PythonOME Script","PolicyData":{"Actions":[{"Name":"Ignore","TemplateId":100}],"Catalogs":[{"CatalogName":"Application","Categories":[0],"SubCategories":[0]}],"DeviceTypes":[],"Devices":[{{  device_id }}],"Groups":[],"Schedule":{"CronString":"* * * ? * * *","EndTime":"","Interval":false,"StartTime":"2022-01-10 05:00:00.019"},"Severities":[2],"UndiscoveredTargets":[]},"State":true}'
+            validate_certs: False
+            status_code: [200, 201]
+          register: alert_policy_response
+          with_items: "{{ hostname_list }}"
+#          loop_control:
+#            loop_var: item
+
+            
+
+        - name: Print the result of disabling alerts
+          debug:
+            msg: "{{ host_response.results[0].json.value[0].Id }}"
+          with_items: "{{ hostname_list }}"
+
+        - name: Get the Id from the alert policy
+          set_fact:
+            alert_policy_id: "{{ host_response.results[0].json.value[0].Id }}"
+          with_items: "{{ hostname_list }}"
+
+        - name: Print the alert policy ID
+          debug:
+            msg: "Alert Policy ID: {{ alert_policy_id }}"
+          with_items: "{{ hostname_list }}"
+
+        #Reminder that changes are about to applied to the host
+        - pause:
+            prompt: "THIS WILL REBOOT THE HOST(S) MULTIPLE TIMES - Press enter if you're ready to do the firmware update on {{ hostname }}"
+                
+##############################
+#This is where the fun begins#
+##############################
+       
+    - name: Run firmware update #Don't forget to update this so the password is hidden in the logs
+      shell: |
+        python update_firmware_using_catalog.py --ip "{{ base_url }}" --user "{{ omeusername }}" --password "{{ omepassword }}" --device-names "{{ hostname }}" --catalog-name "Dell Online Catalog" --updateactions upgrade --sleep-interval 60 --maximum-retries 120
+      register: result
+      ignore_errors: yes
+
+
+    - name: Check if reboot is needed
+      set_fact:
+        reboot_needed: true
+      when: '"Stage To Next Reboot option is selected" in result.stdout'
+
+    - name: Reboot the server and dont wait for it to come back up so we can reboot multiple hosts at the same time 1
+      become: yes
+      shell: "reboot"
+      async: 45
+      poll: 0
+      delegate_to: "{{ item }}"
+      loop: "{{ hostname.split(',') }}"
+      ###when: reboot_needed
+
+    - name: Pause for 30 seconds 1
+      pause:
+        seconds: 30
+        
+    - name: Wait for hosts to come online 1
+      wait_for_connection:
+        timeout: 300  # Maximum time to wait for the host to come online (in seconds)
+      delegate_to: "{{ item }}"
+      loop: "{{ hostname.split(',') }}"
+
+
+
+    - name: Reset reset variable
+      set_fact: 
+        reboot_needed: "False"
+
+#It would be nice to have this in a loop but just running the same commands again two more times to make sure the all of the firmware updates are installed
+    - name: Run firmware update again #Don't forget to update this so the password is hidden in the logs
+      shell: |
+        python update_firmware_using_catalog.py --ip "{{ base_url }}" --user "{{ omeusername }}" --password "{{ omepassword }}" --device-name "{{ hostname }}" --catalog-name "Dell Online Catalog" --updateactions upgrade --sleep-interval 60 --maximum-retries 120
+
+    - name: Check if reboot is needed
+      set_fact:
+        reboot_needed: true
+      when: '"Stage To Next Reboot option is selected" in result.stdout'
+
+    - name: Reboot the server and dont wait for it to come back up so we can reboot multiple hosts at the same time 2
+      become: yes
+      shell: "reboot"
+      async: 45
+      poll: 0
+      delegate_to: "{{ item }}"
+      loop: "{{ hostname.split(',') }}"
+      ###when: reboot_needed
+
+    - name: Pause for 30 seconds 2
+      pause:
+        seconds: 30
+        
+    - name: Wait for hosts to come online 2
+      wait_for_connection:
+        timeout: 300  # Maximum time to wait for the host to come online (in seconds)
+      delegate_to: "{{ item }}"
+      loop: "{{ hostname.split(',') }}"
+  
+
+    # - name: Reboot host anyway just in case an update was missed2
+      # reboot:
+        # reboot_timeout: 3600
+      # delegate_to: "{{ item }}"
+      # become: true
+      # async: 3600
+      # poll: 0
+      # loop: "{{ hostname.split(',') }}"
+      ##when: reboot_needed
+
+    # - name: Wait for reboots to complete2
+      # async_status:
+        # jid: "{{ item.ansible_job_id }}"
+      # register: job_status
+      # until: job_status.finished
+      # retries: 30
+      # delay: 10
+      # loop: "{{ ansible_play_batch }}"
+
+
+
+
+    - name: Reset reset variable
+      set_fact: 
+        reboot_needed: "False"
+
+    - name: Run firmware update again #Don't forget to update this so the password is hidden in the logs
+      shell: |
+        python update_firmware_using_catalog.py --ip "{{ base_url }}" --user "{{ omeusername }}" --password "{{ omepassword }}" --device-name "{{ hostname }}" --catalog-name "Dell Online Catalog" --updateactions upgrade --sleep-interval 60 --maximum-retries 120
+
+    # - name: Check if reboot is needed
+      # set_fact:
+        # reboot_needed: true
+      # when: '"Stage To Next Reboot option is selected" in result.stdout'
+
+    # - name: Reboot host and Wait for it to to restart
+      # reboot:
+        # reboot_timeout: 3600
+      # delegate_to: "{{ item }}"
+      # become: true
+      # loop: "{{ hostname.split(',') }}"      
+      # when: reboot_needed      
+
+
+    - name: Reboot the server and dont wait for it to come back up so we can reboot multiple hosts at the same time 3
+      become: yes
+      shell: "reboot"
+      async: 45
+      poll: 0
+      delegate_to: "{{ item }}"
+      loop: "{{ hostname.split(',') }}"
+      ###when: reboot_needed
+
+    - name: Pause for 30 seconds 3
+      pause:
+        seconds: 30
+        
+    - name: Wait for hosts to come online 3
+      wait_for_connection:
+        timeout: 300  # Maximum time to wait for the host to come online (in seconds)
+      delegate_to: "{{ item }}"
+      loop: "{{ hostname.split(',') }}"
+    - name: Reset reset variable
+      set_fact: 
+        reboot_needed: "False"
+#End of firmware update block (Ideally the above will be in a loop)
+
+
+    #Have the user check and confirm that the firmware upgrade worked
+    - pause:
+        prompt: "Press enter if you've checked that the firmware upgrade worked on {{ hostname }}"
+
+
+    - name: (re)Create user session
+      ansible.builtin.uri:
+        url: "{{  base_url }}/api/SessionService/Sessions"
+        user: "{{ omeusername }}"
+        password: "{{ omepassword }}"
+        method: "POST"
+        force_basic_auth: yes
+        validate_certs: no  #This should be enabled in production
+        headers:
+          Accept: "application/json"
+          Content-Type: "application/json"
+        body:
+          UserName: "{{ omeusername }}"
+          Password: "{{ omepassword }}"
+          SessionType: "API"
+        body_format: json
+        status_code: [200, 201]
+      delegate_to: localhost
+      register: auth_response
+
+
+    - name: Print the response
+      debug:
+        msg: "{{auth_response}}"
+
+    - name: Extract authentication token
+      set_fact:
+        auth_token: "{{ auth_response.x_auth_token }}"
+
+    - name: Delete the Alert Policy
+      uri:
+        url: "{{ base_url }}/api/AlertService/Actions/AlertService.RemoveAlertPolicies"
+        method: POST
+        body_format: json
+        body: "{\"AlertPolicyIds\":[{{ alert_policy_id }}]}"
+        headers: 
+            X-Auth-Token: "{{ auth_token }}"
+        status_code: 204
+        validate_certs: no #This should be enabled in production
+      register: delete_policy_result
+      with_items: "{{ hostname_list }}"
+
+    - name: Check the response status code
+      fail:
+        msg: "Error deleting alert policy. Status code: {{ delete_policy_result.status }}, Response: {{ delete_policy_result.json }}"
+      when: delete_policy_result.status != 204
+      with_items: "{{ hostname_list }}"
+
+    - name: Display success message
+      debug:
+        msg: "Deleted alert policy"
+        
+   
+
+
+
+    
