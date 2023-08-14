@@ -1,3 +1,5 @@
+#See also https://github.com/dnhsoft/sysinfo/blob/master/sysinfo.sh
+
 echo "Starting lldpd so its ready for later"
 sudo systemctl start lldpd
 
