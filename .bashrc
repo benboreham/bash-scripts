@@ -11,6 +11,9 @@
 # ... or force ignoredups and ignorespace
 HISTCONTROL=ignoredups:ignorespace
 
+#Lets not add these to the history huh
+HISTIGNORE='reset:reboot:shutdown *' 
+
 # append to the history file, don't overwrite it
 shopt -s histappend
 
