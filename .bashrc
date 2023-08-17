@@ -117,3 +117,5 @@ alias doupdate="cd ~/rcmon-osc; git pull origin master; pip install --upgrade ."
 
 #Cows are boring
 export ANSIBLE_NOCOWS=1
+
+echo tmux set mouse
